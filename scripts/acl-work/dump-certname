@@ -1,0 +1,101 @@
+#!/usr/bin/python
+# -*- Python -*-
+
+import OpenSSL.crypto as c
+from pyasn1.type import univ, tag, constraint, char, namedtype
+from pyasn1.codec.ber.decoder import stDumpRawValue
+from pyasn1.codec.der import decoder
+from pyasn1_modules.rfc2459 import SubjectAltName, IssuerAltName
+import sys
+import json
+import binascii
+
+canon_comp = {
+    "commonname" : "cn",
+    "countryname" : "c",
+    "stateorprovincename" : "st",
+    "localityname" : "l",
+    "organizationname" : "o",
+    "organizationalunitname" : "ou"
+}
+    
+def get_dn( cname ):
+    res = {}
+    for k,v in cname.get_components():
+        k = canon_comp.get(k.lower(), k.lower())
+        if k not in res:
+            res[k] = [ v ]
+        else:
+            res[k].append(v)
+    return res
+
+def get_altname( ext, spec):
+    decoder.decode.defaultErrorState = stDumpRawValue
+    p,_ = decoder.decode(ext,asn1Spec=spec)
+
+    res = {}
+    for i,v in enumerate(p):
+        # dump those classes we know how to dump - ignore others
+        cname = v.getName().lower()
+        if cname == 'dnsname':
+            tag = 'dns'
+            val = v.getComponent().prettyPrint().lower()
+        elif cname == 'rfc822name':
+            tag = 'email'
+            val = v.getComponent().prettyPrint()
+        elif cname == 'ipaddress':
+            tag = 'ip'
+            val = v.getComponent().asNumbers()
+            if len(val) == 4:
+                o1,o2,o3,o4 = val
+                val = '%d.%d.%d.%d' % (o1,o2,o3,o4)
+            elif len(val) == 16:
+                o1,o2,o3,o4,o5,o6,o7,o8,o9,o10,o11,o12,o13,o14,o15,o16 = val
+                val = '%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x' % \
+                    (o1,o2,o3,o4,
+                     o5,o6,o7,o8,
+                     o9,o10,o11,o12,
+                     o13,o14,o15,o16)
+            else: # What? IP address neither IPv4 nor IPv6?
+                val = v.getComponent().prettyPrint()
+        else:
+            continue # ignore unknown tags
+        if tag not in res:
+            res[tag] = [ val ]
+        else:
+            res[tag].append( val )
+        
+
+    return res
+    
+
+def main():
+    sbuf = ''.join(sys.stdin.readlines())
+    res = { "dn" : {},
+            "issuer": {},
+            "san" : {},
+            "ian" : {}}
+
+    try:
+        cert = c.load_certificate(c.FILETYPE_PEM, sbuf)
+        res["dn"] = get_dn(cert.get_subject())
+        res["issuer"] = get_dn(cert.get_issuer())
+
+        cnt = cert.get_extension_count()
+        for ndx in xrange(0,cnt):
+            ext = cert.get_extension(ndx)
+            sname = ext.get_short_name().lower()
+
+            if sname == "subjectaltname":
+                res["san"] = get_altname(ext.get_data(), SubjectAltName())
+            elif sname == "issueraltname":
+                res["ian"] = get_altname(ext.get_data(), IssuerAltName())
+            else:
+                continue # not interested
+    except c.Error, e:
+        pass
+    sys.stdout.write(json.dumps(res))
+
+if __name__ == '__main__':
+    main()
+# end of file

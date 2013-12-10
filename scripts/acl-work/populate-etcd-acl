@@ -1,0 +1,190 @@
+#!/usr/bin/python
+# -*- Python -*-
+
+import errno
+import sys
+import yaml
+import etcd
+import argparse
+import re
+import json
+from pprint import pprint
+from urlparse import urlparse
+
+def read_yaml( fname ):
+   try:
+      with open(fname, 'r') as f:
+         y = yaml.load(f)
+         return y
+   except (yaml.scanner.ScannerError,yaml.parser.ParserError),e:
+      sys.stderr.write("Error in ACL YAML file %s: %r\n" % (fname, e))
+   except (IOError,OSError),e:
+      sys.stderr.write("Error in reading ACL file %s: %r\n" % (fname, e))
+   return {}
+
+def validate_mapping( mappings ):
+   if type(mappings) != list:
+      sys.stderr.write("Mappings must be an array of mapping authcid -> authzid\n")
+      return False
+   for m in mappings:
+      if type(m) != dict or set(m.keys()) < set(["conditions", "id"]):
+         sys.stderr.write("Mapping must be a dictionary with keys at least 'conditions', 'id'\n")
+         return False
+      if 'root' not in m:
+         m['root'] = '/' # add in default
+      c = m['conditions']
+      if type(c) != list:
+         sys.stderr.write("Mapping conditions must be a list of (element,value) pairs\n")
+         return False
+      for con in c:
+         if type(con) != dict or set(con.keys()) < set(["element", "value"]):
+            sys.stderr.write("Mapping condition must be a dictionary with keys: element,value\n")
+            return False
+         elm = con['element']
+         val = con['value']
+         con['nocase'] = False
+         con['maxgrp'] = 0
+         con['regex'] = val.startswith('/')
+         if con['regex']:
+            # strip first '/'
+            con['value'] = con['value'][1:].strip()
+            # string ending '/'
+            if con['value'].endswith('/'):
+               con['value'] = con['value'][:-1]
+            elif con['value'].endswith('/i'):
+               con['value'] = con['value'][:-2]
+               con['nocase'] = True
+            con['value'] = con['value'].strip()
+            val = con['value']
+            try:
+               r = re.compile(val)
+               con['maxgrp'] = r.groups # max number of capture groups
+            except re.error,e:
+               sys.stderr.write('%r is not a valid regular expression : %r\n' % (val, e))
+               return False
+      if type(m['id']) != str:
+         sys.stderr.write("Mapped ID (%r) must be a string value\n" % (m["id"],))
+         return False
+      m['id'] = m['id'].strip()
+
+      # we need to check here if the regex capture groups in the ID
+      # have a greater number than the allowed group numbers in the
+      # preceding conditions.
+      #
+      # In other words, if we've specified a condition which says
+      # foo-([a-z]+)-bar-([0-9]+), that gives us 2 match groups: $1
+      # and $2. So if the id then says something like
+      # id: user-$1-$2@$3 then $3 can never have a value, and this
+      # is an error.
+      
+      for mch in re.findall(r'\$([0-9][0-9]*)', m['id']):
+         grpnum = long(mch) # get the group number
+         if grpnum != 0:
+            for c in m['conditions']:
+               if grpnum > c['maxgrp']:
+                  sys.stderr.write("Matching group is greater than number of groups available in condition (%s,%s)\n" % (c['element'],c['value']))
+                  return False
+
+   return True
+
+def validate_acl_rules( acls ):
+   if type(acls) != list:
+      sys.stderr.write('ACL must be a list of access control rules\n')
+      return False
+   for r in acls:
+      if type(r) != dict or set(r.keys()) < set(["path","acl"]):
+         sys.stderr.write("acl rule must be a mapping with keys path, acl\n")
+         return False
+      p = r["path"]
+      a = r["acl"]
+      if type(p) != str:
+         sys.stderr.write("ACL path must be a string (%r)\n" % (p,))
+         return False
+      if type(a) != list:
+         sys.stderr.write("ACL rule must be a list of rights mappings (%r)\n" % (a,))
+         return False
+      for rm in a:
+         if type(rm) != dict or set(rm.keys()) < set(["id", "rights"]):
+            sys.stderr.write("Rights mapping must be a dictionary containing keys id, rights\n")
+            return False
+         i = rm["id"]
+         right = rm["rights"]
+         if type(i) != str:
+            if type(i) != list:
+               sys.stderr.write("AuthzID (%r) must be a string or a list of strings\n" % (i,))
+               return False
+            else:
+               for subid in i:
+                  if type(subid) != str:
+                     sys.stderr.write("AuthzID (%r) must be a string or a list of strings\n" % (i,))
+                     return False
+         if type(right) != str or not set([x for x in right]).issubset(set(['r','w','n'])):
+            sys.stderr.write("Rights expression (%r) must be a string containing 'r','w' or 'n'\n" % (right,))
+            return False
+         if 'w' in right and 'r' not in right:
+            # w implies a r privilege
+            right = right + 'r'
+   return True
+
+def validate_acl( acl ):
+   """
+   Validate and canonicalize the ACL tree
+   """
+   if type(acl) != dict or set(acl.keys()) < set(["mapping", "acl"]):
+      sys.stderr.write("Top level ACL needs to be a dictionary with keys mapping, and acl\n")
+      return False
+   if not validate_mapping(acl['mapping']):
+      return False
+   if not validate_acl_rules(acl['acl']):
+      return False
+   return True
+
+def populate_tree(c, acl):
+   """
+   decorate the _auth subtree of the etcd DIT
+   """
+
+   # first the mappings
+   for i,m in enumerate(acl["mapping"]):
+      nodename = "/_auth/mapping/%03d" % (i,)
+      c.set(nodename, json.dumps(m))
+
+   # now the paths
+   for a in acl["acl"]:
+      nodename = "/_auth/acl%s%s" % (a["path"] if a["path"].startswith("/") else "/" + a["path"],
+                                     "_acl" if a["path"].endswith("/") else "")
+      c.set(nodename, json.dumps(a["acl"]))
+
+def main():
+   parser = argparse.ArgumentParser(description="Populate etcd with ACL data")
+
+   parser.add_argument('-f','--file',type=str,metavar='FILE',
+                       default='etcd-acl.yml',
+                       help='file containing YAML specification of ACLs [default %default]')
+   parser.add_argument('-u','--uri',type=str,metavar='URI',
+                       default='http://127.0.0.1:4001',
+                       help='URI to reach etcd instance [default %default]')
+   args = parser.parse_args()
+   up = urlparse(args.uri)
+
+   try:
+      c = etcd.Client(host=up.hostname if up.hostname is not None else '127.0.0.1',
+                      port=up.port if up.port is not None else 4001,
+                      allow_redirect=True)
+      _ = c.machines
+   except etcd.EtcdException,e:
+      sys.stderr.write('Unable to contact etcd cluster: %r\n' % (e,))
+      sys.exit(-1)
+
+   acl = read_yaml(args.file)
+   # suspect colander would prob be better for validating ACL rules
+   if not validate_acl(acl):
+      sys.stderr.write("ACL file is invalid. Ignoring\n")
+      sys.exit(-1)
+
+   populate_tree(c, acl)
+
+if __name__ == '__main__':
+   main()
+
+# end of file

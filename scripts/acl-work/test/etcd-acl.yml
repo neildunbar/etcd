@@ -1,0 +1,22 @@
+---
+mapping:
+  - conditions:
+      - element: dn.cn
+        value: /ndunbar/
+      - element: san.email
+        value: ndunbar@jingitlabs.com
+    id: foo
+  - conditions:
+      - element: san.dns
+        value: /^([^.]+).d(ev)?.jingit.io$/i
+    id: $1
+    root: /host
+
+acl:
+  - path: /foo/bar/baz
+    acl:
+      - { id: [ foo, +bar ], rights: w }
+      - { id: +users, rights: r }
+      - { id: anonymous, rights: r }
+  - {path: /,  acl: [{ id: ndunbar, rights: rw }, { id: +users, rights: r }, { id: anonymous, rights: n }]}
+        
