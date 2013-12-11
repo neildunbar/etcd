@@ -1,16 +1,20 @@
 ---
 mapping:
   - conditions:
-      - element: dn.cn
-        value: /ndunbar/
       - element: san.email
-        value: ndunbar@jingitlabs.com
-    id: foo
+        value: /^(Neil\.?Dunbar)@jingit.*$/i
+      - element: dn.cn
+        value: /^n(eil)?dunbar$/
+    id: ident-$1
   - conditions:
       - element: san.dns
-        value: /^([^.]+).d(ev)?.jingit.io$/i
-    id: $1
+        value: /^([^.]+).(d(ev)?).jingit.io$/i
+    id: $1-$2
     root: /host
+
+groups:
+  baz: [ foobar, +bar ]
+  bar: [ foo, quux ]
 
 acl:
   - path: /foo/bar/baz

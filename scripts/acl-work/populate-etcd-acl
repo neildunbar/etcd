@@ -1,6 +1,7 @@
 #!/usr/bin/python
 # -*- Python -*-
 
+import os
 import errno
 import sys
 import yaml
@@ -139,6 +140,59 @@ def validate_acl( acl ):
       return False
    return True
 
+def expand_groups( acl ):
+   """
+   Expand the (local) group names inside the YAML document
+   """
+
+   egroups = {}
+   expanded_groups = set([])
+
+   if "groups" not in acl: return # no groups to expand
+   if type(acl["groups"]) != dict:
+      return egroups
+
+   igrps = acl["groups"]
+   for g in igrps:
+      groups_to_expand = [ g ]
+      while True:
+         if not groups_to_expand: break
+
+         gte = groups_to_expand[0]
+         groups_to_expand = groups_to_expand[1:]
+
+         l = igrps[gte]
+         if gte not in igrps:
+            expanded_groups.add(gte)
+            break
+
+         if type(l) == str: l = [ l ]
+         if type(l) != list:
+            expanded_groups.add(gte)
+            break
+
+         if gte not in egroups: egroups[gte] = []
+
+         expanded = True
+         for el in l:
+            el = el.strip().lower()
+
+            if el[0] == '+':
+               if el[1:] in expanded_groups:
+                  egroups[g].extend(egroups[el[1:]])
+               else:
+                  groups_to_expand.insert(0,el[1:])
+                  groups_to_expand.append(gte) # push back on stack
+                  expanded = False
+                  break
+            else:
+               egroups[gte].append(el)
+         if expanded:
+            expanded_groups.add(gte)
+            egroups[gte] = list(set(egroups[gte]))
+
+   return egroups
+
 def populate_tree(c, acl):
    """
    decorate the _auth subtree of the etcd DIT
@@ -148,6 +202,17 @@ def populate_tree(c, acl):
    for i,m in enumerate(acl["mapping"]):
       nodename = "/_auth/mapping/%03d" % (i,)
       c.set(nodename, json.dumps(m))
+
+   # now the groups
+   groupbase = "/_auth/groups"
+   for a in acl["groups"]:
+      nodename = "%s/%s" % (groupbase,a)
+      c.set(nodename, json.dumps(acl["groups"][a]))
+   
+   # remove nodes not in acl group list
+   for n in c.get(groupbase):
+      _,groupname = os.path.split(n.key)
+      if groupname not in acl["groups"]: c.delete(n.key)
 
    # now the paths
    for a in acl["acl"]:
@@ -181,6 +246,8 @@ def main():
    if not validate_acl(acl):
       sys.stderr.write("ACL file is invalid. Ignoring\n")
       sys.exit(-1)
+
+   acl["groups"] = expand_groups(acl)
 
    populate_tree(c, acl)
 
