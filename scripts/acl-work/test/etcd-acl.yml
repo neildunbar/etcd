@@ -13,8 +13,8 @@ mapping:
     root: /host
 
 groups:
-  baz: [ foobar, +bar ]
-  bar: [ foo, quux ]
+  baz: [ ident-neil.dunbar ]
+  foo: [ +baz ]
 
 acl:
   - path: /foo/bar/baz

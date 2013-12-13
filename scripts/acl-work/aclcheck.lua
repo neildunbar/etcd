@@ -119,6 +119,40 @@ function is_match(val, cond, sval)
    end
 end
 
+function groups_for_id( uri, authzid )
+   local res = {}
+
+   -- scan groups which contain the authzid string
+   
+   local groupbase = uri .. "/v2/keys/_auth/groups?recursive=true"
+   body,c,l = http.request(groupbase)
+   if c ~= 200 then
+      return res
+   end
+
+   local response = j.decode(body)
+   if response["node"] == nil or response["node"]["nodes"] == nil then
+      return res
+   end
+   local nodes = response["node"]["nodes"]
+
+   for _,g in pairs(nodes) do
+      if g["dir"] == nil then
+         local gval = j.decode(g["value"])
+
+         for _,member in pairs(gval) do
+            print ("Matching " .. authzid .. " against " .. member .. " in group " .. g["key"])
+            if authzid == member then
+               table.insert(res, lp.basename(g["key"]))
+               break -- can skip scanning the rest of this group
+            end
+         end
+      end
+   end
+
+   return res
+end
+
 function check_mapping(m, uri, ch, cn)
    local v = cn
 
@@ -133,7 +167,7 @@ function check_mapping(m, uri, ch, cn)
                if type(ev) == "string" then
                   local r = is_match(ev, c, m["id"])
                   if r then
-                     return { ["authzid"] = r; ["groups"] = {} }
+                     return { ["authzid"] = r; ["groups"] = groups_for_id( uri, r ) }
                   end
                end
             end
@@ -151,7 +185,7 @@ function map_cert_name_to_id( ch, cn, uri )
    body,c,l = http.request(uri .. "/v2/machines")
    if c ~= 200 then
       -- something wrong in etcd land
-      res["authzid"] = "anonymous"
+      res["authzid"] = "!anonymous!"
       res["groups"] = {}
       return res
    end
@@ -159,7 +193,7 @@ function map_cert_name_to_id( ch, cn, uri )
    body,c,l = http.request(uri .. "/v2/keys/_auth/mapping?recursive=true")
    if c ~= 200 then
       -- something wrong in etcd land
-      res["authzid"] = "anonymous"
+      res["authzid"] = "!anonymous!"
       res["groups"] = {}
       return res
    end
@@ -170,7 +204,7 @@ function map_cert_name_to_id( ch, cn, uri )
       if res then return res end
    end
 
-   return { ["authzid"] = "anonymous"; ["groups"] = {} }
+   return { ["authzid"] = "!anonymous!"; ["groups"] = {} }
 end
 
 function main()

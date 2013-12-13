@@ -1,6 +1,18 @@
 #!/usr/bin/python
 # -*- Python -*-
 
+"""
+Populate the _auth directory in etcd with the contents of a YAML file
+describing ACL rules. Blows away anything which is already in the _auth directory.
+
+The ACLs rules describe three sections
+
+ * mapping (rules which map authcids to authzids) groups (rules which
+ * bind group names to expansions of either authzids or subgroups)
+ * ACLs (rules which specify authzids or groupnames, paths, and the
+   rights which those authzids have over that path and its inferiors)
+"""
+
 import os
 import errno
 import sys
@@ -155,16 +167,20 @@ def expand_groups( acl ):
    igrps = acl["groups"]
    for g in igrps:
       groups_to_expand = [ g ]
-      while True:
-         if not groups_to_expand: break
-
+      while groups_to_expand:
+         before = set(groups_to_expand)
          gte = groups_to_expand[0]
          groups_to_expand = groups_to_expand[1:]
 
-         l = igrps[gte]
+
          if gte not in igrps:
             expanded_groups.add(gte)
             break
+
+         l = igrps[gte]
+         # a group can be defined as either a list of entities or as a
+         # single entity (in non group syntax); God knows why you'd
+         # want to do that, but still...
 
          if type(l) == str: l = [ l ]
          if type(l) != list:
@@ -184,12 +200,18 @@ def expand_groups( acl ):
                   groups_to_expand.insert(0,el[1:])
                   groups_to_expand.append(gte) # push back on stack
                   expanded = False
+                  after = set(groups_to_expand)
+                  if before == after:
+                     sys.stderr.write("WARNING: Possible unterminated recursion in expansion groups %r\n" % (after,))
+                     # the group expansion now is almost certainly wrong
+                     groups_to_expand = []
                   break
             else:
                egroups[gte].append(el)
-         if expanded:
-            expanded_groups.add(gte)
-            egroups[gte] = list(set(egroups[gte]))
+         if expanded: expanded_groups.add(gte)
+   
+   # de-dupe the group expansions
+   for k,v in egroups.iteritems(): egroups[k] = list(set(egroups[k]))
 
    return egroups
 
@@ -198,13 +220,33 @@ def populate_tree(c, acl):
    decorate the _auth subtree of the etcd DIT
    """
 
+   authbase = "/_auth"
+
    # first the mappings
+   mapbase = "%s/mapping" % (authbase,)
+
+   maxmap = -1
    for i,m in enumerate(acl["mapping"]):
       nodename = "/_auth/mapping/%03d" % (i,)
       c.set(nodename, json.dumps(m))
+      maxmap = i
 
+   # now clean mappings not in the list
+   for n in c.get(mapbase):
+      _,mapname = os.path.split(n.key)
+      try:
+         mapnum = long(mapname)
+         # zap the map if it lies outside the previous numbers
+         if mapnum < 0 or mapnum > maxmap:
+            print "Zapping %s (number out of range)" % (n.key,)
+            c.delete(n.key)
+      except ValueError:
+         # not a numerical key? zap it.
+         print "Zapping %s (value not numeric)" % (n.key,)
+         c.delete(n.key)
+      
    # now the groups
-   groupbase = "/_auth/groups"
+   groupbase = "%s/groups" % (authbase,)
    for a in acl["groups"]:
       nodename = "%s/%s" % (groupbase,a)
       c.set(nodename, json.dumps(acl["groups"][a]))
